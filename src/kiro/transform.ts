@@ -1,5 +1,4 @@
-// Vendored from pi-kiro (MIT, Copyright (c) 2026 Hongyi Lyu) and adapted for
-// API-key auth. See NOTICE.
+// Vendored from pi-kiro (MIT, Copyright (c) 2026 Hongyi Lyu). See NOTICE.
 //
 // pi Message[] → Kiro history transformation.
 //
@@ -81,7 +80,7 @@ export const TOOL_RESULT_LIMIT = 250_000;
 
 /**
  * Origin tag sent on every userInputMessage. The API-key provider uses the
- * same `AI_EDITOR` origin for discovery and GenerateAssistantResponse.
+ * same AI_EDITOR origin for discovery and GenerateAssistantResponse.
  */
 export const KIRO_ORIGIN = "AI_EDITOR";
 
@@ -90,49 +89,6 @@ export function truncate(text: string, limit: number): string {
   if (text.length <= limit) return text;
   const half = Math.floor(limit / 2);
   return `${text.substring(0, half)}\n... [TRUNCATED] ...\n${text.substring(text.length - half)}`;
-}
-
-// ---- Tool ID normalization -----------------------------------------------
-
-/**
- * Kiro rejects tool-use IDs that contain `|` or exceed 64 chars
- * (`REQUEST_BODY_INVALID`). Cross-provider IDs (e.g. OpenAI Responses
- * `call_…|fc_…`) must be normalized. Native Kiro IDs pass through unchanged.
- */
-const KIRO_TOOL_USE_ID_PATTERN = /^[a-zA-Z0-9_.:-]{1,64}$/;
-
-export function toKiroToolUseId(toolUseId: string): string {
-  if (KIRO_TOOL_USE_ID_PATTERN.test(toolUseId)) return toolUseId;
-  const digest = createHash("sha256").update(toolUseId).digest("base64url").slice(0, 32);
-  return `pi_${digest}`;
-}
-
-// ---- Tool result relocation ----------------------------------------------
-
-/**
- * Reorder messages so that each toolResult immediately follows its
- * corresponding assistant turn. Concurrent tool execution can interleave
- * results across turns; this is a pure reorder (no generate/discard).
- */
-export function relocateDisplacedToolResults(messages: Message[]): Message[] {
-  const out: Message[] = [];
-  const pending = [...messages];
-  while (pending.length > 0) {
-    const msg = pending.shift() as Message;
-    out.push(msg);
-    if (msg.role !== "assistant") continue;
-    const am = msg as AssistantMessage;
-    if (!Array.isArray(am.content)) continue;
-    for (const block of am.content) {
-      if (block.type !== "toolCall") continue;
-      const id = (block as ToolCall).id;
-      const at = pending.findIndex(
-        (p) => p.role === "toolResult" && (p as ToolResultMessage).toolCallId === id,
-      );
-      if (at >= 0) out.push(...pending.splice(at, 1));
-    }
-  }
-  return out;
 }
 
 export function extractImages(msg: Message): ImageContent[] {
@@ -171,12 +127,193 @@ export function parseToolArgs(input: unknown): Record<string, unknown> {
   }
 }
 
+// ---- Tool ID normalization ---------------------------------------------
+
+/**
+ * Kiro rejects cross-provider tool-use IDs that exceed 64 characters or
+ * contain unsupported characters (for example OpenAI Responses IDs such as
+ * `call_…|fc_…`). Native Kiro IDs pass through unchanged; other IDs are
+ * deterministically remapped so the matching tool result gets the same ID.
+ */
+const KIRO_TOOL_USE_ID_PATTERN = /^[a-zA-Z0-9_.:-]{1,64}$/;
+
+export function toKiroToolUseId(toolUseId: string): string {
+  if (KIRO_TOOL_USE_ID_PATTERN.test(toolUseId)) return toolUseId;
+  const digest = createHash("sha256").update(toolUseId).digest("base64url").slice(0, 32);
+  return `pi_${digest}`;
+}
+
+/**
+ * Reorder displaced tool results so each result follows the assistant turn
+ * that issued it. Pi can finish concurrent tool calls out of transcript order;
+ * Kiro validates the pairing by turn and rejects the interleaved shape.
+ */
+export function relocateDisplacedToolResults(messages: Message[]): Message[] {
+  const out: Message[] = [];
+  const pending = [...messages];
+  while (pending.length > 0) {
+    const msg = pending.shift() as Message;
+    out.push(msg);
+    if (msg.role !== "assistant") continue;
+    const assistant = msg as AssistantMessage;
+    if (!Array.isArray(assistant.content)) continue;
+    for (const block of assistant.content) {
+      if (block.type !== "toolCall") continue;
+      const id = (block as ToolCall).id;
+      const index = pending.findIndex(
+        (candidate) =>
+          candidate.role === "toolResult" &&
+          (candidate as ToolResultMessage).toolCallId === id,
+      );
+      if (index >= 0) out.push(...pending.splice(index, 1));
+    }
+  }
+  return out;
+}
+
+type JsonObject = Record<string, unknown>;
+
+function isJsonObject(value: unknown): value is JsonObject {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function uniqueValues(values: unknown[]): unknown[] {
+  const seen = new Set<string>();
+  const result: unknown[] = [];
+  for (const value of values) {
+    const key = JSON.stringify(value);
+    if (key === undefined || seen.has(key)) continue;
+    seen.add(key);
+    result.push(value);
+  }
+  return result;
+}
+
+/**
+ * Kiro's runtime accepts a restricted object-oriented JSON Schema dialect for
+ * tool inputs. Pi/MCP schemas legitimately use unions (`anyOf`/`oneOf`) and
+ * draft metadata (`$schema`), but Kiro recently started rejecting those with
+ * the unhelpful REQUEST_BODY_INVALID / "Invalid tool use format" response.
+ *
+ * This is only a wire-schema adaptation. Pi still executes and validates the
+ * original tool definition, so the conversion deliberately favors a schema
+ * Kiro can ingest over trying to express every union branch losslessly.
+ */
+function sanitizeKiroSchema(value: unknown, root = false): JsonObject {
+  if (!isJsonObject(value)) {
+    return root ? { type: "object", properties: {} } : {};
+  }
+
+  for (const unionKey of ["anyOf", "oneOf", "allOf"] as const) {
+    const alternatives = value[unionKey];
+    if (Array.isArray(alternatives) && alternatives.length > 0) {
+      const branches = alternatives.map((branch) => sanitizeKiroSchema(branch));
+      const objectBranches = branches.filter(
+        (branch) => branch.type === "object" || isJsonObject(branch.properties),
+      );
+
+      if (objectBranches.length > 0) {
+        const properties: JsonObject = {};
+        for (const branch of objectBranches) {
+          if (!isJsonObject(branch.properties)) continue;
+          for (const [name, schema] of Object.entries(branch.properties)) {
+            properties[name] = sanitizeKiroSchema(schema);
+          }
+        }
+        return {
+          type: "object",
+          properties,
+          ...(typeof value.description === "string" ? { description: value.description } : {}),
+        };
+      }
+
+      const first = branches[0] ?? {};
+      const types = uniqueValues(branches.map((branch) => branch.type).filter((type) => typeof type === "string"));
+      const enums = branches.flatMap((branch) => {
+        if (Array.isArray(branch.enum)) return branch.enum;
+        if (Object.prototype.hasOwnProperty.call(branch, "const")) return [branch.const];
+        return [];
+      });
+
+      // A union of same-typed scalar branches can be represented faithfully.
+      // For mixed scalar types Kiro's schema validator is less permissive, so
+      // retain the first branch as the safest model-facing approximation.
+      if (types.length === 1 && enums.length > 0) {
+        return {
+          ...first,
+          type: types[0],
+          enum: uniqueValues(enums),
+        };
+      }
+      return root && first.type !== "object"
+        ? { type: "object", properties: {} }
+        : first;
+    }
+  }
+
+  const result: JsonObject = {};
+  for (const [key, child] of Object.entries(value)) {
+    // Draft identifiers and references are not resolvable by Kiro's runtime.
+    if (key === "$schema" || key === "$id" || key === "$ref" || key === "$defs" || key === "definitions") {
+      continue;
+    }
+    // Convert `const` into the widely-supported enum form.
+    if (key === "const") {
+      result.enum = [child];
+      continue;
+    }
+    if (key === "properties" && isJsonObject(child)) {
+      const properties: JsonObject = {};
+      for (const [name, schema] of Object.entries(child)) {
+        properties[name] = sanitizeKiroSchema(schema);
+      }
+      result.properties = properties;
+      continue;
+    }
+    if (key === "items") {
+      result.items = Array.isArray(child)
+        ? child.map((item) => sanitizeKiroSchema(item))
+        : sanitizeKiroSchema(child);
+      continue;
+    }
+    if (key === "additionalProperties" && isJsonObject(child)) {
+      result.additionalProperties = sanitizeKiroSchema(child);
+      continue;
+    }
+    if (key === "type" && Array.isArray(child)) {
+      const firstType = child.find((type): type is string => typeof type === "string");
+      if (firstType) result.type = firstType;
+      continue;
+    }
+    if (key === "required" && Array.isArray(child)) {
+      result.required = child.filter((name): name is string => typeof name === "string");
+      continue;
+    }
+    result[key] = child;
+  }
+
+  if (root) {
+    // Bedrock/Kiro tool inputSchema.json must always be an object, even when
+    // a caller's generic JSON Schema describes a scalar or array root.
+    result.type = "object";
+    if (!isJsonObject(result.properties)) result.properties = {};
+    delete result.items;
+    delete result.enum;
+  }
+
+  return result;
+}
+
+export function sanitizeKiroToolSchema(parameters: unknown): Record<string, unknown> {
+  return sanitizeKiroSchema(parameters, true);
+}
+
 export function convertToolsToKiro(tools: Tool[]): KiroToolSpec[] {
   return tools.map((tool) => ({
     toolSpecification: {
       name: tool.name,
-      description: tool.description,
-      inputSchema: { json: tool.parameters as Record<string, unknown> },
+      description: tool.description?.trim() || `Tool ${tool.name}`,
+      inputSchema: { json: sanitizeKiroToolSchema(tool.parameters) },
     },
   }));
 }
@@ -259,16 +396,13 @@ export function buildHistory(
 
     if (msg.role === "assistant") {
       let armContent = "";
-      let armHadBlocks = false;
       const armToolUses: KiroToolUse[] = [];
       if (Array.isArray(msg.content)) {
         for (const block of msg.content) {
           if (block.type === "text") {
             armContent += (block as TextContent).text;
-            armHadBlocks = true;
           } else if (block.type === "thinking") {
-            // Do not serialize reasoning into Kiro assistant text history.
-            armHadBlocks = true;
+            armContent = `<thinking>${(block as ThinkingContent).thinking}</thinking>\n\n${armContent}`;
           } else if (block.type === "toolCall") {
             const tc = block as ToolCall;
             armToolUses.push({
@@ -276,11 +410,10 @@ export function buildHistory(
               toolUseId: toKiroToolUseId(tc.id),
               input: parseToolArgs(tc.arguments),
             });
-            armHadBlocks = true;
           }
         }
       }
-      if (!armContent && armToolUses.length === 0 && !armHadBlocks) continue;
+      if (!armContent && armToolUses.length === 0) continue;
       history.push({
         assistantResponseMessage: {
           content: armContent,

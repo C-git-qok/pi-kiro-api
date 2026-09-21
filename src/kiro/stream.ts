@@ -8,7 +8,7 @@
 // API-key adaptations vs. the OAuth-based upstream:
 //   - sends the `tokentype: API_KEY` header
 //   - uses the `AI_EDITOR` origin (see transform.KIRO_ORIGIN)
-//   - posts to the service root with X-Amz-Target (baseUrl is "…/")
+//   - posts to the API-key CodeWhisperer service root with X-Amz-Target
 //   - drops the OAuth profileArn (ListAvailableProfiles) pre-flight lookup,
 //     which API-key auth neither uses nor supports
 
@@ -18,7 +18,6 @@ import type {
   AssistantMessageEventStream,
   Context,
   ImageContent,
-  Message,
   Model,
   SimpleStreamOptions,
   TextContent,
@@ -96,12 +95,10 @@ function firstTokenTimeoutForModel(modelId: string): number {
 
 /**
  * Placeholder surfaced to downstream UIs during the deliberation window
- * on models that hide reasoning (e.g. Claude Opus 4.7 with
+ * on models that hide reasoning (e.g. Claude Opus 4.7+ with
  * adaptive-thinking `display: "omitted"`). Emitted as a `thinking_delta`
  * only after the countdown elapses without any real output — fast
- * responses produce no delta at all. Clients drop the block at
- * `thinking_end` either via the empty-text predicate (zero-delta fast
- * path) or via a known-placeholder predicate (slow path).
+ * responses produce no delta at all.
  */
 const HIDDEN_REASONING_PLACEHOLDER = "Reasoning hidden by provider";
 
@@ -113,15 +110,6 @@ const HIDDEN_REASONING_PLACEHOLDER = "Reasoning hidden by provider";
  */
 export const HIDDEN_REASONING_COUNTDOWN_MS = 2000;
 
-/**
- * Open a redacted ThinkingContent block at the start of the stream. The
- * block begins with empty `thinking` text so every pi-ai-compatible UI
- * treats it as a live indicator. The block is either closed empty (fast
- * path) or has `emitHiddenReasoningMarker` mutate it mid-stream (slow
- * path) before closing.
- *
- * Returns the `contentIndex` of the pushed block.
- */
 function emitHiddenReasoningStart(
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
@@ -137,14 +125,6 @@ function emitHiddenReasoningStart(
   return contentIndex;
 }
 
-/**
- * Populate an open redacted-thinking block with the placeholder marker.
- * Fires from the countdown timer when the first real output event hasn't
- * arrived within `HIDDEN_REASONING_COUNTDOWN_MS`. Mutates the block in
- * place and emits a single `thinking_delta` so UIs that render accumulated
- * thinking text (inkstone, pi-coding-agent) display the marker until
- * `thinking_end` arrives.
- */
 function emitHiddenReasoningMarker(
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
@@ -162,13 +142,6 @@ function emitHiddenReasoningMarker(
   });
 }
 
-/**
- * Close a block previously opened by `emitHiddenReasoningStart`. Always
- * emits `thinking_end` with empty content — the accumulated text (if any)
- * lives on `output.content[contentIndex].thinking`. UIs that drop
- * redacted-thinking blocks do so either via an empty-text check or via a
- * known-placeholder predicate; both shapes work with empty `content`.
- */
 function closeHiddenReasoning(
   output: AssistantMessage,
   stream: AssistantMessageEventStream,
@@ -273,10 +246,6 @@ export function streamKiro(
     // Hoisted above the try/catch so the terminal error path can close it
     // to prevent downstream UIs from hanging on an orphan live indicator.
     let hiddenThinkingIndex: number | null = null;
-    // Countdown timer that emits the user-visible marker delta if the
-    // first real output event doesn't arrive within
-    // HIDDEN_REASONING_COUNTDOWN_MS of `thinking_start`. Hoisted alongside
-    // `hiddenThinkingIndex` so every exit path can cancel it.
     let hiddenMarkerTimer: ReturnType<typeof setTimeout> | null = null;
     let hiddenMarkerEmitted = false;
 
@@ -286,8 +255,6 @@ export function streamKiro(
         throw new Error("Kiro API key not set. Set KIRO_API_KEY in your environment.");
       }
 
-      // API-key auth uses the regional CodeWhisperer service root. The
-      // operation is selected by X-Amz-Target below.
       const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/";
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
@@ -296,6 +263,7 @@ export function streamKiro(
       // redacted ThinkingContent shim so downstream UIs can show a
       // "reasoning hidden" marker via the standard pi-ai contract.
       const reasoningHidden = !!(model as KiroModel).reasoningHidden;
+
       log.debug("request.init", {
         endpoint,
         model: model.id,
@@ -357,7 +325,6 @@ export function streamKiro(
                 armContent += (b as TextContent).text;
                 armHadBlocks = true;
               } else if (b.type === "thinking") {
-                // Do not serialize reasoning into Kiro assistant text history.
                 armHadBlocks = true;
               } else if (b.type === "toolCall") {
                 const tc = b as ToolCall;
@@ -455,9 +422,9 @@ export function streamKiro(
           if (imgs.length > 0) currentImages = convertImagesToKiro(imgs);
         }
 
-        // -- Whole-conversation repair ---------------------------------
-        // Combine history + current message, validate against Kiro's
-        // invariants, and repair any structural issues before sending.
+        // Repair the whole conversation, including the current tool-result
+        // carrier. Concurrent Pi tool executions can interleave results from
+        // different assistant turns; Kiro validates those pairings strictly.
         const currentMessage: KiroUserInputMessage = {
           content: currentContent,
           modelId: kiroModelId,
@@ -465,7 +432,6 @@ export function streamKiro(
           ...(currentImages ? { images: currentImages } : {}),
           ...(uimc ? { userInputMessageContext: uimc } : {}),
         };
-
         const conversationEntries = kiroConversationEntries(history, currentMessage);
         const repair = repairKiroConversation(conversationEntries, {
           modelId: kiroModelId,
@@ -478,7 +444,6 @@ export function streamKiro(
           });
         }
 
-        // Split back: current message is always the last entry
         const repairedCurrent = repair.entries[repair.entries.length - 1]?.userInputMessage;
         let wireHistory: KiroHistoryEntry[];
         let wireContent: string;
@@ -516,8 +481,8 @@ export function streamKiro(
         // -- HTTP request with capacity-retry inner loop -----------------
         // Emit `start` and the hidden-reasoning indicator *before* the
         // fetch so the live indicator covers the server-side deliberation
-        // window (which is where the 25-30s wait actually happens on
-        // Claude 4.7 — the model reasons before sending any bytes).
+        // window (which is where the wait actually happens on reasoning
+        // models — the model reasons before sending any bytes).
         stream.push({ type: "start", partial: output });
         if (reasoningHidden && thinkingEnabled && hiddenThinkingIndex === null) {
           hiddenThinkingIndex = emitHiddenReasoningStart(output, stream);
@@ -541,10 +506,10 @@ export function streamKiro(
           log.debug("request.send", {
             attempt: retryCount,
             capacityAttempt: capacityRetryCount,
-            historyLen: history.length,
-            currentContentLen: currentContent.length,
+            historyLen: wireHistory.length,
+            currentContentLen: wireContent.length,
             hasImages: !!currentImages,
-            toolResultCount: currentToolResults.length,
+            toolResultCount: wireUimc?.toolResults?.length ?? 0,
           });
 
           response = await fetch(endpoint, {
@@ -554,7 +519,8 @@ export function streamKiro(
               Accept: "application/json",
               Authorization: `Bearer ${apiKey}`,
               tokentype: "API_KEY",
-              "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+              "X-Amz-Target":
+                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
               "x-amzn-kiro-agent-mode": "vibe",
               "x-amzn-codewhisperer-optout": "true",
               "amz-sdk-invocation-id": crypto.randomUUID(),
@@ -635,7 +601,6 @@ export function streamKiro(
           currentToolCall = null;
         };
 
-        /** Cancel the countdown timer without closing the block. */
         const cancelHiddenMarkerTimer = () => {
           if (hiddenMarkerTimer) {
             clearTimeout(hiddenMarkerTimer);
@@ -643,18 +608,6 @@ export function streamKiro(
           }
         };
 
-        /**
-         * Close the hidden-reasoning block before the first real
-         * content/tool event is emitted (happy path) or on stream end
-         * (defensive). Cancels the countdown timer, emits `thinking_end`
-         * with empty content, and sets `hiddenThinkingIndex = null` so
-         * subsequent events don't try to close an already-closed block.
-         *
-         * The accumulated `thinking` text (if the countdown fired) lives
-         * on `output.content[contentIndex].thinking` — downstream UIs
-         * either drop the block via an empty-text predicate (fast path)
-         * or via a known-placeholder predicate (slow path).
-         */
         const closeHiddenBreadcrumb = () => {
           cancelHiddenMarkerTimer();
           if (hiddenThinkingIndex !== null) {
@@ -695,8 +648,8 @@ export function streamKiro(
             ]);
             // Always clear the timer — otherwise the happy path keeps the
             // event loop alive for firstTokenTimeout ms after the stream
-            // ends, which for opus-4-7 (180s) is user-visible as a hang
-            // before a short-lived CLI exits.
+            // ends, which is user-visible as a hang before a short-lived
+            // CLI exits.
             if (firstTokenTimer) clearTimeout(firstTokenTimer);
             if (result === FIRST_TOKEN_SENTINEL) {
               readPromise.catch(() => {});
@@ -720,7 +673,6 @@ export function streamKiro(
               seq: chunkSeq++,
               bytes: value?.byteLength ?? 0,
               decodedLen: decoded.length,
-              // Printable preview of the decoded chunk — control chars shown as \xNN.
               preview: previewChunk(decoded),
             });
           }
@@ -821,16 +773,10 @@ export function streamKiro(
               `stream ${firstTokenTimedOut ? "first-token timed out" : idleCancelled ? "idle timed out" : `error: ${streamError}`} — retrying (${retryCount}/${MAX_RETRIES})`,
             );
             await abortableDelay(delayMs, options?.signal);
-            // Close any open live indicator (cancels the countdown timer
-            // and emits thinking_end with empty content) so the retry can
-            // open a fresh block at contentIndex 0. pi-agent-core's
-            // indexed assignment overwrites the prior block on the new
-            // thinking_start, keeping consumer state in sync.
+            // Close any open live indicator before the retry opens a fresh
+            // block at contentIndex 0. pi-agent-core's indexed assignment
+            // overwrites the prior block on the new thinking_start.
             closeHiddenBreadcrumb();
-            // Reset output content. Consumer-side `partial.content[contentIndex]`
-            // (see pi-agent-core proxy.js) uses indexed assignment, so when the
-            // retry re-emits `text_start` at contentIndex 0 it overwrites the
-            // stale block — consumer state stays in sync with ours.
             output.content = [];
             textBlockIndex = null;
             continue;
@@ -886,9 +832,6 @@ export function streamKiro(
             retryCount++;
             const delayMs = exponentialBackoff(retryCount - 1, 1000, MAX_RETRY_DELAY_MS);
             log.warn(`empty response — retrying (${retryCount}/${MAX_RETRIES})`);
-            // Close the still-open block (gotAnyOutput was false above,
-            // so the block is still open here). Cancels the countdown
-            // timer and emits thinking_end with empty content.
             closeHiddenBreadcrumb();
             output.content = [];
             textBlockIndex = null;
@@ -896,15 +839,12 @@ export function streamKiro(
             continue;
           }
           log.warn(`empty response persisted after ${MAX_RETRIES} retries`);
-          // No retries left — close the block so downstream doesn't hang
-          // on an orphan open thinking_start.
           closeHiddenBreadcrumb();
         }
 
-        // Stop reason classification per doc/conformance.md §35–37:
-        // toolUse when tools were called; length when no contextUsage event
-        // was received AND no tool calls (treated as truncation signal); stop
-        // otherwise.
+        // Stop reason classification: toolUse when tools were called; length
+        // when no contextUsage event was received AND no tool calls (treated
+        // as a truncation signal); stop otherwise.
         if (!receivedContextUsage && emittedToolCalls === 0) {
           output.stopReason = "length";
         } else {
@@ -929,12 +869,8 @@ export function streamKiro(
       output.stopReason = options?.signal?.aborted ? "aborted" : "error";
       output.errorMessage = error instanceof Error ? error.message : String(error);
       log.debug("response.caught", { stopReason: output.stopReason, error: output.errorMessage });
-      // Close any still-open live-indicator block before the error event.
-      // Cancels the countdown timer (if still pending) so no stray
-      // thinking_delta fires after the stream ends, and emits
-      // thinking_end so downstream UIs don't hang on an orphan
-      // thinking_start. The block's accumulated text (if the countdown
-      // fired) stays on output.content[i].thinking for history/export.
+      // Close any still-open live-indicator block before the error event so
+      // downstream UIs don't hang on an orphan thinking_start.
       if (hiddenMarkerTimer) {
         clearTimeout(hiddenMarkerTimer);
         hiddenMarkerTimer = null;
