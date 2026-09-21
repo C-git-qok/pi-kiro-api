@@ -296,7 +296,7 @@ export function repairKiroConversation(
       userInputMessage: {
         content: "",
         modelId: options?.modelId ?? "",
-        origin: (options?.origin ?? KIRO_ORIGIN) as "KIRO_CLI",
+        origin: options?.origin ?? KIRO_ORIGIN,
         userInputMessageContext: { toolResults: syntheticResults },
       },
     };

@@ -58,16 +58,6 @@ import {
   EMPTY_CONTENT_PLACEHOLDER,
 } from "./history-validator.ts";
 
-// ---- Region resolution --------------------------------------------------
-
-const DEFAULT_REGION = "us-east-1";
-
-function getRegion(): string {
-  const raw = globalThis.process?.env?.KIRO_API_REGION;
-  const region = typeof raw === "string" ? raw.trim() : "";
-  return region || DEFAULT_REGION;
-}
-
 // ---- Retry / timeout constants -----------------------------------------
 
 const FIRST_TOKEN_TIMEOUT_DEFAULT_MS = 90_000;
@@ -217,7 +207,7 @@ interface KiroRequest {
     currentMessage: { userInputMessage: KiroUserInputMessage };
     history?: KiroHistoryEntry[];
   };
-  profileArn?: string;
+  agentMode: "vibe";
 }
 
 interface KiroToolCallState {
@@ -296,10 +286,9 @@ export function streamKiro(
         throw new Error("Kiro API key not set. Set KIRO_API_KEY in your environment.");
       }
 
-      // Runtime endpoint — uses runtime.*.kiro.dev instead of the legacy
-      // q.<region>.amazonaws.com service root.
-      const region = getRegion();
-      const endpoint = `https://runtime.${region}.kiro.dev/generateAssistantResponse`;
+      // API-key auth uses the regional CodeWhisperer service root. The
+      // operation is selected by X-Amz-Target below.
+      const endpoint = model.baseUrl || "https://q.us-east-1.amazonaws.com/";
       const kiroModelId = resolveKiroModel(model.id);
       const thinkingEnabled = !!options?.reasoning || model.reasoning;
       // Kiro models where upstream hides reasoning entirely (no `<thinking>`
@@ -307,9 +296,6 @@ export function streamKiro(
       // redacted ThinkingContent shim so downstream UIs can show a
       // "reasoning hidden" marker via the standard pi-ai contract.
       const reasoningHidden = !!(model as KiroModel).reasoningHidden;
-      // Profile ARN from discovery — required by runtime.*.kiro.dev
-      const profileArn = (model as KiroModel).profileArn;
-
       log.debug("request.init", {
         endpoint,
         model: model.id,
@@ -322,7 +308,6 @@ export function streamKiro(
         toolCount: context.tools?.length ?? 0,
         hasSystemPrompt: !!context.systemPrompt,
         sessionId: options?.sessionId,
-        hasProfileArn: !!profileArn,
       });
 
       let systemPrompt = context.systemPrompt ?? "";
@@ -426,7 +411,7 @@ export function streamKiro(
             const converted = convertImagesToKiro(toolResultImages);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
-          currentContent = currentToolResults.length > 0 ? "" : "Please proceed with the task.";
+          currentContent = currentToolResults.length > 0 ? "Tool results provided." : "Please proceed with the task.";
         } else if (firstMsg?.role === "toolResult") {
           const toolResultImages: ImageContent[] = [];
           for (const m of currentMessages) {
@@ -448,7 +433,7 @@ export function streamKiro(
             const converted = convertImagesToKiro(toolResultImages);
             currentImages = currentImages ? [...currentImages, ...converted] : converted;
           }
-          currentContent = "";
+          currentContent = "Tool results provided.";
         } else if (firstMsg?.role === "user") {
           currentContent = typeof firstMsg.content === "string" ? firstMsg.content : getContentText(firstMsg);
           if (systemPrompt && !systemPrepended) {
@@ -525,7 +510,7 @@ export function streamKiro(
             },
             ...(wireHistory.length > 0 ? { history: wireHistory } : {}),
           },
-          ...(profileArn ? { profileArn } : {}),
+          agentMode: "vibe",
         };
 
         // -- HTTP request with capacity-retry inner loop -----------------
@@ -565,12 +550,15 @@ export function streamKiro(
           response = await fetch(endpoint, {
             method: "POST",
             headers: {
-              "Content-Type": "application/json",
+              "Content-Type": "application/x-amz-json-1.0",
               Accept: "application/json",
               Authorization: `Bearer ${apiKey}`,
               tokentype: "API_KEY",
+              "X-Amz-Target": "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
               "x-amzn-kiro-agent-mode": "vibe",
               "x-amzn-codewhisperer-optout": "true",
+              "amz-sdk-invocation-id": crypto.randomUUID(),
+              "amz-sdk-request": "attempt=1; max=1",
               "x-amz-user-agent": ua,
               "user-agent": ua,
             },
@@ -608,9 +596,9 @@ export function streamKiro(
           if (isTooBigError(response.status, errText)) {
             throw new Error(`Kiro API error: context_length_exceeded (${response.status} ${errText})`);
           }
-          if (response.status === 403) {
+          if (response.status === 401 || response.status === 403) {
             throw new Error(
-              `Kiro API error: API key rejected (403) — check KIRO_API_KEY. ${errText}`,
+              `Kiro API error: API key rejected (${response.status}) — check KIRO_API_KEY. ${errText}`,
             );
           }
           throw new Error(`Kiro API error: ${response.status} ${response.statusText} ${errText}`);

@@ -80,10 +80,10 @@ export interface KiroHistoryEntry {
 export const TOOL_RESULT_LIMIT = 250_000;
 
 /**
- * Origin tag sent on every userInputMessage. Kiro runtime-compatible
- * providers use `KIRO_CLI` for API-key auth (CLI/headless automation).
+ * Origin tag sent on every userInputMessage. The API-key provider uses the
+ * same `AI_EDITOR` origin for discovery and GenerateAssistantResponse.
  */
-export const KIRO_ORIGIN = "KIRO_CLI";
+export const KIRO_ORIGIN = "AI_EDITOR";
 
 /** Middle-ellipsis truncation: preserve start and end. */
 export function truncate(text: string, limit: number): string {

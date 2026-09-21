@@ -68,12 +68,8 @@ export function resolveKiroModel(modelId: string): string {
 // already scopes the result by region, org, and entitlement — a hand-kept
 // region map could only drift out of agreement with it.
 
-/**
- * Legacy fallback base URL — only used when discovery has not run.
- * At startup, discover.ts queries the management API and each model
- * receives its own runtime.*.kiro.dev baseUrl.
- */
-const FALLBACK_BASE_URL = "https://runtime.us-east-1.kiro.dev";
+/** Default API-key service-root endpoint used until discovery supplies one. */
+const FALLBACK_BASE_URL = "https://q.us-east-1.amazonaws.com/";
 const ZERO_COST = Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 });
 
 /** Fields every Kiro model shares. Spread into each literal below. */
@@ -112,11 +108,20 @@ export interface KiroModel {
    * See https://docs.anthropic.com/en/docs/build-with-claude/adaptive-thinking
    */
   reasoningHidden?: boolean;
-  /** Profile ARN from GetProfile — required by runtime.*.kiro.dev. */
-  profileArn?: string;
 }
 
 export const kiroModels: KiroModel[] = [
+  {
+    ...KIRO_DEFAULTS,
+    id: "claude-opus-4-8",
+    name: "Claude Opus 4.8",
+    reasoning: true,
+    reasoningHidden: true,
+    input: MULTIMODAL,
+    contextWindow: 1_000_000,
+    maxTokens: 128_000,
+    firstTokenTimeout: 180_000,
+  },
   {
     ...KIRO_DEFAULTS,
     id: "claude-opus-4-7",

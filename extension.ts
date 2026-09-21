@@ -2,6 +2,13 @@ import { discoverKiroModels } from "./src/kiro/discover.ts";
 import { streamKiro } from "./src/kiro/stream.ts";
 
 const PROVIDER_ID = "kiro-api-key";
+const DEFAULT_REGION = "us-east-1";
+
+function getRegion(): string {
+  const raw = globalThis.process?.env?.KIRO_API_REGION;
+  const region = typeof raw === "string" ? raw.trim() : "";
+  return region || DEFAULT_REGION;
+}
 
 function getApiKey(): string {
   const raw = globalThis.process?.env?.KIRO_API_KEY;
@@ -31,16 +38,13 @@ export default async function registerKiroApiKeyProvider(pi: {
 }): Promise<void> {
   const apiKey = getApiKey();
 
-  // discoverKiroModels now handles:
-  //   1. GetProfile → profileArn
-  //   2. List-Available-Models → models
-  // Each model includes its runtime baseUrl and profileArn.
+  const region = getRegion();
+  const baseUrl = `https://q.${region}.amazonaws.com/`;
   const models = await discoverKiroModels(apiKey);
 
   pi.registerProvider(PROVIDER_ID, {
     name: "Kiro (API Key)",
-    // Placeholder — each model carries its own runtime baseUrl from discovery
-    baseUrl: "https://runtime.us-east-1.kiro.dev",
+    baseUrl,
     apiKey: "$KIRO_API_KEY",
     api: "kiro-api",
     models,
