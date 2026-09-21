@@ -1,0 +1,27 @@
+{
+  "name": "pi-kiro-api",
+  "version": "0.4.0-fork",
+  "description": "Kiro API-key provider for pi (fork with latest upstream sync)",
+  "type": "module",
+  "main": "extension.ts",
+  "exports": {
+    ".": "./extension.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./extension.ts"
+    ]
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "kiro",
+    "provider",
+    "api-key"
+  ],
+  "author": "fork by asdf",
+  "license": "MIT",
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*"
+  }
+}
