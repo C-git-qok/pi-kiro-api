@@ -336,12 +336,6 @@ Kiro-compatible representation
 推荐：
 
 ```bash
-pi install git:github.com/<YOUR_GITHUB_USER>/pi-kiro-api
-```
-
-例如：
-
-```bash
 pi install git:github.com/C-git-qok/pi-kiro-api
 ```
 
@@ -358,7 +352,7 @@ pi list
 ## 本地开发安装
 
 ```bash
-git clone https://github.com/<YOUR_GITHUB_USER>/pi-kiro-api.git
+git clone https://github.com/C-git-qok/pi-kiro-api.git
 cd pi-kiro-api
 
 bun install
