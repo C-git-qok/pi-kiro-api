@@ -12,6 +12,9 @@
 > * 兼容 Kiro Runtime 的 tool-use / tool-result 历史格式
 > * 规范化跨 provider 的 Tool Call ID
 > * 修复并发工具执行导致的历史交错问题
+> * 适配 Pi 0.86+ `TranscriptContext`（从 messages 恢复 system prompt / tools）
+> * 修复软失败（`How can I help?` / 空 current content）与 repair 吞正文
+> * 清洗 Kiro 不接受的 tool input JSON Schema（`anyOf`/`$schema` 等）
 > * 尽量保持原项目的 API-key 认证方式不变
 
 ---
@@ -31,6 +34,7 @@ pi-kiro-api-fork
  │
  ├─ KIRO_API_KEY
  ├─ Model Discovery
+ ├─ TranscriptContext recovery (system / tools)
  ├─ Message / Tool Transformation
  ├─ Kiro History Validation / Repair
  └─ Kiro Runtime Request
@@ -206,6 +210,28 @@ Invalid tool use format
 
 同时 Tool Use 和 Tool Result 必须使用相同的转换规则。
 
+### Tool input Schema 清洗（`sanitizeKiroSchema`）
+
+除 ID 外，Kiro 还可能拒绝上游 / MCP 带来的 JSON Schema 方言，例如：
+
+```text
+anyOf / oneOf / allOf
+$schema / $ref / $defs
+const
+type: ["object", "null"]
+非 object 根类型
+```
+
+provider 在 `convertToolsToKiro` 发送前做 **wire-only** 清洗（`sanitizeKiroToolSchema`）：
+
+* 并集尽量收敛为 Kiro 可接受的 object / 标量近似
+* 去掉不可解析的 draft 元数据
+* 保证 `inputSchema.json` 根类型为 object
+
+Pi 本地仍按原始 tool definition 校验；清洗只影响发往 Kiro 的请求体。
+
+典型对应错误仍见：`REQUEST_BODY_INVALID` / `Invalid tool use format`。
+
 ---
 
 # 5. Tool Result 重新排序
@@ -295,6 +321,38 @@ toolResult(B)
 
 也不会使用默认值掩盖真实工具失败。
 
+### Step 2 语义合并（禁止吞正文 / tools）
+
+相邻 user 条目中，若前一条是 **空 content 载体**（仅有 toolResults），后一条可能携带：
+
+```text
+user 正文
+images
+userInputMessageContext.tools   ← 从 TranscriptContext 恢复的 39 个工具
+userInputMessageContext.toolResults
+```
+
+历史缺陷曾只合并 `toolResults`、丢弃后一条的 content/tools，导致：
+
+```text
+wireContent = "(empty)"
+uimc.tools  丢失
+input ≈ 473 → 模型回 "How can I help?"
+```
+
+当前实现通过 `mergeUserInputMessages` **完整合并**：
+
+```text
+content   ← \n\n 拼接
+images    ← 拼接
+tools     ← 拼接
+toolResults ← 拼接
+```
+
+### 深拷贝（P1）
+
+`repairKiroConversation` 入口对 entries 做 nested 深拷贝，避免 retry / 并行 stream 共享引用互相污染。
+
 ---
 
 # 7. Thinking / Reasoning 兼容
@@ -326,6 +384,60 @@ Kiro-compatible representation
 ```
 
 避免因为 reasoning 文本被错误注入 history 而触发 Runtime validation 或产生上下文污染。
+
+---
+
+# 8. Pi 0.86+ TranscriptContext 恢复
+
+Pi 0.86+ 起，provider 入口收到的是 **`TranscriptContext`**，而不是旧的 `Context`：
+
+```text
+旧 Context
+  systemPrompt?: string
+  messages: Message[]
+  tools?: Tool[]
+
+新 TranscriptContext
+  messages: Message[]   ← system / tools 折叠进 leading system message
+  （brand symbol：裸 Context 无法直接进 provider）
+```
+
+agent-loop 调用 `normalizeContext({ messages })` 后**不再**向 provider 传顶层 `systemPrompt` / `tools`。
+
+若 provider 仍读 `context.systemPrompt` / `context.tools`，会得到：
+
+```text
+systemPrompt = ""
+tools        = undefined
+```
+
+→ history 无 system 注入、`uimc.tools` 为空 → 软失败（见常见问题）。
+
+本 fork 的正式迁移（非 fallback）：
+
+```text
+getCurrentSystemPrompt(context.messages)  → 恢复 system 文本
+getCurrentTools(context.messages)         → 恢复当前 tool 集合
+```
+
+并在 wire 路径 **过滤** `role === "system"`：
+
+```text
+messages
+  ├─ system  → 只进 recoveredSystemPrompt / recoveredTools
+  ├─ buildHistory 显式 skip system（防止落入 toolResult 分支）
+  └─ user / assistant / toolResult → Kiro history / current
+```
+
+`request.init` 日志字段（便于自测）：
+
+```text
+rawMessageCount
+recoveredSystemLen
+recoveredToolCount
+```
+
+（不再依赖已无意义的 `toolCount: context.tools?.length` / `hasSystemPrompt`。）
 
 ---
 
@@ -527,10 +639,20 @@ response.error
 endpoint
 model
 kiroModelId
+rawMessageCount
+recoveredSystemLen
+recoveredToolCount
 historyLen
 currentContentLen
 toolResultCount
-hasProfileArn
+```
+
+期望量级（软失败修复后，随会话变大）：
+
+```text
+recoveredSystemLen  > 0
+recoveredToolCount  > 0（注册了工具时，例如 39）
+currentContentLen   ≈ 真实 user 正文（不应长期为 7 = "(empty)"）
 ```
 
 敏感信息绝对不要写入日志：
@@ -613,9 +735,60 @@ Tool ID normalization
 Tool Result relocation
 +
 History validation / repair
++
+sanitizeKiroSchema（tool input JSON Schema 清洗）
 ```
 
 但 Kiro 服务端的 validation 仍可能变化。
+
+---
+
+## 子代理只回 `How can I help?` / input≈473（软失败）
+
+典型现象：
+
+```text
+HTTP 200
+output 很短（约 4 tools）
+文案固定为 "How can I help?"
+usage.input ≈ 473（仅服务端自带 system + 空壳正文）
+```
+
+这不是网络 400，而是 **发出去的 current/user 正文与 tools 为空**。
+
+根因链（已修）：
+
+```text
+Pi 0.86+ 只传 TranscriptContext.messages
+        ↓
+provider 未恢复 system/tools（旧读法 context.systemPrompt/tools）
+        ↓
+buildHistory 把 system 误入 toolResult 分支 → 孤儿载体
+        ↓
+repair Step2 只合并 toolResults，吞掉 user 正文 / tools
+        ↓
+wireContent="(empty)"，uimc.tools 丢失
+        ↓
+模型看不到任务 → How can I help?
+```
+
+对应修复：
+
+```text
+A' TranscriptContext + getCurrentSystemPrompt/getCurrentTools
+B  buildHistory 跳过 role==="system"
+C' repair 完整 merge content/images/tools/toolResults
+P1 repair 深拷贝防并行污染
+```
+
+自测时看：
+
+```text
+recoveredSystemLen > 0
+recoveredToolCount > 0
+currentContentLen  = 真实正文长度（≠ 7）
+不再出现 How can I help? 空转
+```
 
 ---
 
@@ -760,8 +933,9 @@ Tool ID normalization
 Tool Result conversion
 Tool Result relocation
 Image conversion
-Tool specification conversion
+Tool specification conversion (+ sanitizeKiroSchema)
 History construction
+buildHistory: 显式跳过 role === "system"
 ```
 
 ---
@@ -774,6 +948,15 @@ History construction
 Kiro history validation
 +
 minimal structural repair
+```
+
+repair 要点：
+
+```text
+Step2 mergeUserInputMessages
+  → 完整合并 content / images / tools / toolResults
+入口 cloneHistoryEntries
+  → nested 深拷贝，防 retry / 并行污染
 ```
 
 不负责：
@@ -791,7 +974,9 @@ minimal structural repair
 负责：
 
 ```text
-Pi streamSimple
+Pi streamSimple (TranscriptContext)
+       ↓
+getCurrentSystemPrompt / getCurrentTools
        ↓
 Kiro Runtime request
        ↓
@@ -990,6 +1175,13 @@ export KIRO_API_KEY=...
 
 # 开发
 
+> **路径约定**：后续源码与文档改动只落在 fork 开发路径  
+> `~/.pi/agent/pi-kiro-api-fork`  
+> 不要直接改在用安装路径  
+> `~/.pi/agent/git/github.com/C-git-qok/pi-kiro-api`  
+> （在用注册名：`git:github.com/C-git-qok/pi-kiro-api`）。  
+> 同步到在用路径 / 改 `settings.json` 由使用者自行决定。
+
 安装依赖：
 
 ```bash
@@ -1114,9 +1306,35 @@ Kiro 是否接受 history
 
 ---
 
+## 6. Kiro 子代理 / soft-fail 回归
+
+让主 agent 拉起 kiro 子代理，确认：
+
+```text
+recoveredSystemLen > 0
+recoveredToolCount > 0
+currentContentLen 为真实任务正文（≠ 7）
+子代理正常执行工具，而不是 How can I help?
+并行 N=2 子代理时 usage/input 不串台
+```
+
+---
+
 # 当前状态
 
 这是一个个人维护 fork，而不是 Kiro 官方项目。
+
+## 近期兼容性修复（工作树）
+
+| 项 | 说明 | 验证 |
+|---|---|---|
+| TranscriptContext 迁移（A'） | Pi 0.86+ 从 `messages` 恢复 system/tools | 离线 S01–S02 + 用户实测 |
+| buildHistory skip system（B） | 防止 system → 孤儿 toolResult | S03 |
+| repair 完整语义合并（C'） | 不再吞 user 正文与 tools | S04–S06 + 历史 drop 用例 |
+| repair 深拷贝（P1） | 并行/retry 不共享 nested 引用 | clone 断言 |
+| `sanitizeKiroSchema` | tool input schema 方言清洗（400） | 与软失败正交 |
+
+Closure level：**`LOCAL_VERIFIED` + 用户 kiro 实测可用**；非 `PRODUCTION_VERIFIED`。
 
 推荐把兼容性状态理解为：
 

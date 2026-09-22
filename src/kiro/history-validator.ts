@@ -184,11 +184,113 @@ export function kiroConversationEntries(
 // ---- Repair --------------------------------------------------------------
 
 /**
+ * Fully merge a following user-input message into the previous one.
+ * Copies content, images, tools, and toolResults — never drops fields.
+ * Required so repair Step 2 cannot swallow user text or the recovered
+ * tool specs that streamKiro placed on the current message.
+ */
+function mergeUserInputMessages(
+  prev: KiroUserInputMessage,
+  curr: KiroUserInputMessage,
+): void {
+  if (curr.content) {
+    prev.content = prev.content
+      ? `${prev.content}\n\n${curr.content}`
+      : curr.content;
+  }
+  if (curr.images?.length) {
+    prev.images = [...(prev.images ?? []), ...curr.images];
+  }
+  const prevCtx = prev.userInputMessageContext;
+  const currCtx = curr.userInputMessageContext;
+  if (prevCtx || currCtx) {
+    const next: NonNullable<KiroUserInputMessage["userInputMessageContext"]> = {
+      ...(prevCtx ?? {}),
+    };
+    if (currCtx?.tools?.length || prevCtx?.tools?.length) {
+      next.tools = [...(prevCtx?.tools ?? []), ...(currCtx?.tools ?? [])];
+    }
+    if (currCtx?.toolResults?.length || prevCtx?.toolResults?.length) {
+      next.toolResults = [
+        ...(prevCtx?.toolResults ?? []),
+        ...(currCtx?.toolResults ?? []),
+      ];
+    }
+    prev.userInputMessageContext = next;
+  }
+}
+
+/**
+ * Deep-copy history entries so repair mutations never alias nested
+ * arrays/objects shared with the caller's transcript (retry / parallel
+ * streams would otherwise pollute each other).
+ */
+function cloneHistoryEntries(entries: KiroHistoryEntry[]): KiroHistoryEntry[] {
+  return entries.map((e) => ({
+    ...e,
+    ...(e.userInputMessage
+      ? {
+          userInputMessage: {
+            ...e.userInputMessage,
+            ...(e.userInputMessage.images
+              ? { images: e.userInputMessage.images.map((img) => ({ ...img, source: { ...img.source } })) }
+              : {}),
+            ...(e.userInputMessage.userInputMessageContext
+              ? {
+                  userInputMessageContext: {
+                    ...e.userInputMessage.userInputMessageContext,
+                    ...(e.userInputMessage.userInputMessageContext.tools
+                      ? {
+                          tools: e.userInputMessage.userInputMessageContext.tools.map((t) => ({
+                            ...t,
+                            toolSpecification: {
+                              ...t.toolSpecification,
+                              inputSchema: { json: { ...t.toolSpecification.inputSchema.json } },
+                            },
+                          })),
+                        }
+                      : {}),
+                    ...(e.userInputMessage.userInputMessageContext.toolResults
+                      ? {
+                          toolResults: e.userInputMessage.userInputMessageContext.toolResults.map(
+                            (tr) => ({
+                              ...tr,
+                              content: tr.content.map((c) => ({ ...c })),
+                            }),
+                          ),
+                        }
+                      : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(e.assistantResponseMessage
+      ? {
+          assistantResponseMessage: {
+            ...e.assistantResponseMessage,
+            ...(e.assistantResponseMessage.toolUses
+              ? {
+                  toolUses: e.assistantResponseMessage.toolUses.map((tu) => ({
+                    ...tu,
+                    input: { ...tu.input },
+                  })),
+                }
+              : {}),
+          },
+        }
+      : {}),
+  }));
+}
+
+/**
  * Repair a conversation to satisfy Kiro's invariants.
  *
  * Steps:
  * 1. Remove leading non-user entries (bare tool-result carriers)
- * 2. Merge adjacent pure toolResult user messages
+ * 2. Merge adjacent user messages when previous is an empty-content carrier
+ *    (full semantic merge: content/images/tools/toolResults)
  * 3. Strip orphan and duplicate toolResults
  * 4. Synthesize ERROR tool results for unanswered assistant toolUses
  * 5. Assign placeholder content to empty user messages
@@ -199,7 +301,7 @@ export function repairKiroConversation(
 ): KiroRepairResult {
   const violations: ValidationViolation[] = [];
   let repaired = false;
-  let result = entries.map((e) => ({ ...e }));
+  let result = cloneHistoryEntries(entries);
 
   // Step 1: Remove leading non-user entries
   while (result.length > 0 && !result[0]?.userInputMessage) {
@@ -211,20 +313,25 @@ export function repairKiroConversation(
     });
   }
 
-  // Step 2: Merge adjacent pure toolResult user messages (must be before step 3)
+  // Step 2: Merge adjacent user messages when previous is an empty-content
+  // carrier (must be before step 3). A full semantic merge is required:
+  // only combining toolResults would drop current content and recovered
+  // tools (historically produced wireContent="(empty)", toolCount=0).
   const merged: KiroHistoryEntry[] = [];
   for (const entry of result) {
     if (entry?.userInputMessage && merged.length > 0) {
       const prev = merged[merged.length - 1];
       if (prev?.userInputMessage && !prev.userInputMessage.content) {
-        // Previous is a pure toolResult carrier — merge
         const prevTr = prev.userInputMessage.userInputMessageContext?.toolResults ?? [];
         const currTr = entry.userInputMessage.userInputMessageContext?.toolResults ?? [];
-        if (prevTr.length > 0 || currTr.length > 0) {
-          prev.userInputMessage.userInputMessageContext = {
-            ...prev.userInputMessage.userInputMessageContext,
-            toolResults: [...prevTr, ...currTr],
-          };
+        const hasSemantic =
+          prevTr.length > 0 ||
+          currTr.length > 0 ||
+          !!entry.userInputMessage.content ||
+          !!entry.userInputMessage.images?.length ||
+          !!entry.userInputMessage.userInputMessageContext?.tools?.length;
+        if (hasSemantic) {
+          mergeUserInputMessages(prev.userInputMessage, entry.userInputMessage);
           repaired = true;
           continue;
         }
